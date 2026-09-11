@@ -2,6 +2,8 @@
 
 [English](README.md) | **中文**
 
+> 此 fork 在上游项目基础上扩展了本地用量分析能力，详见下方「此 Fork 的新增改进」。
+
 **看清 Codex 的总用量，也看清每一天、每个模型、项目与会话的投入。**
 
 从本地 Codex Desktop / CLI 会话日志中统计 Token 用量，默认生成可离线使用的 HTML 看板，并请求系统默认外部浏览器打开。安装后，直接说「统计本周用量」即可。
@@ -23,7 +25,7 @@
 使用 Skills CLI 安装到你的 Codex 环境：
 
 ```bash
-npx skills add https://github.com/huajiexiewenfeng/codex-token-usage-skill --skill codex-token-usage
+npx skills add https://github.com/lawrence840/codex-token-usage-skill --skill codex-token-usage
 ```
 
 安装后，在 Codex 中直接输入：
@@ -40,6 +42,14 @@ npx skills add https://github.com/huajiexiewenfeng/codex-token-usage-skill --ski
 统计 2026 年 8 月的用量，生成 HTML 看板。
 ```
 
+```text
+这周哪个模型和会话使用的 Token 最多？
+```
+
+```text
+检查有没有长上下文或高缓存使用的 Codex 会话。
+```
+
 Skill 会解析日期范围、运行统计脚本、生成固定模板的 HTML，并请求外部浏览器打开。
 
 | 模块 | 内容 |
@@ -51,6 +61,19 @@ Skill 会解析日期范围、运行统计脚本、生成固定模板的 HTML，
 | 每日明细 | 含零用量日期的完整列表、排序、精确值提示、CSV 导出 |
 
 Token 显示统一使用 **亿、千万、百万**，不足百万显示完整数字。每日明细也遵循这一规则，悬停提示与 CSV 保留原始数值。
+
+## 此 Fork 的新增改进
+
+本 Fork 保留上游既有的 Token 统计口径，并在完全本地、离线的报告基础上增加：
+
+- 按模型和 reasoning effort 归因。
+- 每个会话只保留一行，展示主导模型、单事件平均 Token，以及本地可用时的会话标题。
+- 按项目目录名、客户端和来源汇总。
+- 对单一会话占比过高、单事件上下文过大、高缓存上下文、长期高用量会话给出可解释的本地诊断。
+- `--privacy strict`：从报告中隐藏会话标题、项目、客户端和来源归因。
+- `--machine-name`：写入 JSON 机器元数据；`--top-sessions`：控制 Markdown 中显示的会话数量。
+
+诊断只是本地启发式规则，不代表 OpenAI 的账单、额度、账户用量或政策阈值。
 
 ## 直接运行脚本
 

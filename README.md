@@ -2,6 +2,8 @@
 
 **English** | [中文](README.zh-CN.md)
 
+> This fork extends the upstream project with detailed local usage profiling. See [What this fork adds](#what-this-fork-adds).
+
 **See your Codex token usage, from the total down to every day, model, project and session.**
 
 Analyze local Codex Desktop / CLI session logs, generate an offline HTML dashboard, and open it in your system's default external browser. After installation, just ask Codex: “Summarize this week's usage.”
@@ -23,7 +25,7 @@ Sort daily details by date or total usage, hover for exact counts, and export a 
 Install into your Codex environment with Skills CLI:
 
 ```bash
-npx skills add https://github.com/huajiexiewenfeng/codex-token-usage-skill --skill codex-token-usage
+npx skills add https://github.com/lawrence840/codex-token-usage-skill --skill codex-token-usage
 ```
 
 Then ask Codex in plain language:
@@ -40,6 +42,14 @@ Show my last 30 days of usage, including daily counts and cache hit rate.
 Generate an HTML dashboard of my usage for August 2026.
 ```
 
+```text
+Which model and session used the most tokens this week?
+```
+
+```text
+Check for long-context or heavily cached Codex sessions.
+```
+
 The skill resolves the dates, runs the report script, generates the fixed HTML template and requests an external browser to open it.
 
 | Section | Contents |
@@ -51,6 +61,19 @@ The skill resolves the dates, runs the report script, generates the fixed HTML t
 | Daily details | All dates including inactive days, sorting, exact-value tooltips and CSV export |
 
 Compact token values use **亿 (100 million), 千万 (10 million) and 百万 (1 million)** in both interface languages. Values below one million are shown in full. Daily tables use the same units; tooltips and CSV retain exact counts.
+
+## What this fork adds
+
+This fork keeps the upstream token-accounting semantics and extends the local, offline report with:
+
+- Model and reasoning-effort attribution.
+- One-row-per-session analysis, including dominant model, average tokens per event and session titles when locally available.
+- Project-basename, client and source summaries.
+- Explainable local diagnostics for dominant sessions, large context per event, heavy cached context and long-lived high-volume sessions.
+- A `--privacy strict` mode that removes session titles, project, client and source attribution from the generated report.
+- `--machine-name` JSON metadata and `--top-sessions` control for Markdown output.
+
+Diagnostics are local heuristics. They are not OpenAI billing, quota, account-usage or policy thresholds.
 
 ## Run the script directly
 
