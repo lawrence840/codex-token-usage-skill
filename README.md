@@ -2,13 +2,13 @@
 
 **English** | [中文](README.zh-CN.md)
 
-**See your Codex token usage, from the total down to every day.**
+**See your Codex token usage, from the total down to every day, model, project and session.**
 
 Analyze local Codex Desktop / CLI session logs, generate an offline HTML dashboard, and open it in your system's default external browser. After installation, just ask Codex: “Summarize this week's usage.”
 
 ## Dashboard preview
 
-Track total and net tokens, cache hit rate, sessions and daily averages. Switch the daily chart between total and net usage, and explore mutually exclusive token categories.
+Track total and net tokens, cache hit rate, sessions and daily averages. The offline dashboard also attributes usage to models, reasoning efforts, clients, projects and sessions, and flags explainable local diagnostics for unusually large contexts.
 
 ![Codex usage dashboard with summary cards, daily trends and token breakdown](docs/images/usage-dashboard.png)
 
@@ -75,6 +75,9 @@ The default output is `output/token-usage-<start>-<end>.html` under the working 
 | `--no-open` | Generate HTML without launching a browser | `--no-open` |
 | `--format` | HTML (default), Markdown or JSON | `--format json` |
 | `--language` | Chinese (default) or English labels | `--language en` |
+| `--machine-name` | Local machine label stored in the JSON schema | `--machine-name HOME-PC` |
+| `--privacy` | `standard` includes local titles/basenames; `strict` hides them | `--privacy strict` |
+| `--top-sessions` | Session rows included in Markdown | `--top-sessions 20` |
 
 “This week” means Monday through today. When using the script directly, pass those dates with `--start` and `--end`; `--days 7` is a rolling seven-day window.
 
@@ -109,7 +112,13 @@ The script reads JSONL files in `sessions/` and `archived_sessions/`, deduplicat
 
 Cache is part of input, and reasoning is part of output; neither is stacked twice. Reported totals may differ from input plus output, and the dashboard states the difference. Weeks start on Monday and count only events in the selected range. Token event counts are not tool call counts.
 
-These are statistics from locally readable logs, not account billing or live quota data. The report does not infer success rates, active duration or model/project rankings. JSON includes summary, daily and weekly rows, peaks, timezone and generation time.
+These are statistics from locally readable logs, not account billing or live quota data. JSON includes summary, daily and weekly rows, peaks, parser diagnostics, model/effort/client/project/session attribution, timezone and generation time. A session remains one session even if it changes models or reasoning effort.
+
+## Usage profiler
+
+The parser keeps the JSONL state needed to attribute each `token_count` event: session metadata, the latest model and reasoning effort, and optional session titles from `session_index.jsonl`. It reports aggregate data only; the HTML never includes prompts, full paths, rollout paths or session UUIDs.
+
+The dashboard adds model, session, client/source and project tables. Local diagnostics identify a dominant session, large average context, heavy cached context and long-lived high-volume sessions. They are transparent heuristics, not official billing, quota or policy thresholds.
 
 ## Local and offline
 

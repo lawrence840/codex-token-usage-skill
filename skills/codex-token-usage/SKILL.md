@@ -1,6 +1,6 @@
 ---
 name: codex-token-usage
-description: Use when the user asks to count, audit, compare, or report local Codex Desktop or CLI token usage, including daily token counts, total or net usage, cache hit rate, peak periods, or an offline HTML usage dashboard.
+description: Use when the user asks to count, audit, compare, or report local Codex Desktop or CLI token usage, including model, reasoning effort, project, client, session attribution, diagnostics, daily token counts, total or net usage, cache hit rate, peak periods, or an offline HTML usage dashboard.
 ---
 
 # Codex Token Usage
@@ -101,6 +101,10 @@ Compact token values, including the 每日明细 (Daily details) table, use 亿 
 
 It includes total/net usage, cache hit rate, session count, daily average, daily stacked bars with total/net modes and keyboard-accessible day selection, token composition, peak day/week, a sortable daily table, and CSV export. Dates use the selected reporting timezone. Zero-usage days count toward the average and remain in every output. JSON retains its existing fields and adds `timezone` and `generated_at`; `daily` now contains every date in the range.
 
-Chart components are **non-cached input + cached input + output**. Cached input is part of input, and reasoning is part of output; never stack either subset on top of its parent. If source totals differ from the component sum, the dashboard states the difference. Do not call token events tool calls, or invent model/project rankings, active time or success rates from the existing parser. This is a generated snapshot, not a live monitor.
+Chart components are **non-cached input + cached input + output**. Cached input is part of input, and reasoning is part of output; never stack either subset on top of its parent. If source totals differ from the component sum, the dashboard states the difference. Read model/project/session rankings from the generated report; do not infer success rates. Diagnostics are local heuristics, not official OpenAI billing, quota or policy thresholds. This is a generated snapshot, not a live monitor.
+
+## Profiler options
+
+Use `--privacy strict` when titles, project basenames and client/source labels should be hidden from the report. Use `--machine-name NAME` to set stable local-report metadata and `--top-sessions N` for Markdown output. Default HTML remains aggregate-only and never contains prompts, full cwd paths, rollout paths or session UUIDs.
 
 Generated reports contain usage aggregates only, without prompts, session IDs or source paths. They remain local unless the user asks to share them. Preserve `assets/dashboard.html` alongside `scripts/` when installing the skill.

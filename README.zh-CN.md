@@ -2,13 +2,13 @@
 
 [English](README.md) | **中文**
 
-**看清 Codex 的总用量，也看清每一天的投入。**
+**看清 Codex 的总用量，也看清每一天、每个模型、项目与会话的投入。**
 
 从本地 Codex Desktop / CLI 会话日志中统计 Token 用量，默认生成可离线使用的 HTML 看板，并请求系统默认外部浏览器打开。安装后，直接说「统计本周用量」即可。
 
 ## 看板预览
 
-总量、净用量、缓存命中率、会话数与日均用量集中展示；每日趋势支持切换总量与净用量，Token 构成按互斥分类拆分。
+总量、净用量、缓存命中率、会话数与日均用量集中展示；每日趋势支持切换总量与净用量，Token 构成按互斥分类拆分。新版还按模型、reasoning effort、客户端、项目和会话归因，并显示可解释的本地诊断提示。
 
 ![Codex 用量看板：汇总指标、每日趋势与 Token 构成](docs/images/usage-dashboard.png)
 
@@ -75,6 +75,9 @@ python -B skills/codex-token-usage/scripts/codex_token_usage.py --days 30 --time
 | `--no-open` | 仅生成 HTML，不启动浏览器 | `--no-open` |
 | `--format` | HTML（默认）、Markdown 或 JSON | `--format json` |
 | `--language` | 中文（默认）或英文界面 | `--language en` |
+| `--machine-name` | 写入 JSON 的本机名称 | `--machine-name HOME-PC` |
+| `--privacy` | `standard` 保留本地标题/目录名；`strict` 隐藏它们 | `--privacy strict` |
+| `--top-sessions` | Markdown 中展示的会话行数 | `--top-sessions 20` |
 
 “本周”按周一至今天统计；直接运行脚本时传入对应的 `--start` 和 `--end`，`--days 7` 表示滚动七天。
 
@@ -108,6 +111,12 @@ Markdown / JSON 默认写入标准输出，不打开浏览器。**旧版依赖�
 | 日均总量 | `总量 ÷ 所选自然日数`，包含零用量日期 |
 
 缓存输入包含在输入中，推理输出包含在输出中，图表不重复叠加。日志总量可能与输入加输出不一致，看板会标明差额。周统计按周一分组，仅计入选定范围内的事件；Token 事件数不等于工具调用次数。
+
+## 用量分析器
+
+解析器按 JSONL 文件顺序维护会话元数据以及最近一次模型、reasoning effort；可选地从 `session_index.jsonl` 读取会话标题。一个会话即使中途切换模型，仍只显示一行。HTML 只嵌入汇总数据，不包含 prompt、会话 UUID、完整 cwd 或 rollout 路径。
+
+看板增加模型、会话、客户端/来源、项目四类表格，并提示单一会话占比过高、超大平均上下文、重缓存上下文和长期高用量会话。这些是本地可解释启发式规则，不是 OpenAI 的账单、额度或政策阈值。
 
 这些是本机可读取日志的统计，不是账户账单或实时配额。报告不推断成功率、活跃时长或模型/项目排名。JSON 包含汇总、每日、每周、峰值、时区与生成时间。
 

@@ -1,363 +1,238 @@
 #!/usr/bin/env python3
+"""Build private, offline Codex usage reports from local JSONL session logs."""
 import argparse
 import calendar
+import contextlib
+import io
 import json
 import os
 import pathlib
 import re
+import socket
 import sys
+import time
 import webbrowser
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, timedelta
+from typing import Any, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
+@dataclass
+class TokenUsage:
+    input: int = 0; cached_input: int = 0; output: int = 0; reasoning: int = 0; total: int = 0
+    @property
+    def fresh_input(self): return max(self.input - self.cached_input, 0)
+    @property
+    def net_usage(self): return self.fresh_input + self.output
+    @property
+    def cache_hit_rate(self): return self.cached_input / self.input if self.input else 0.0
+    def add(self, other):
+        self.input += other.input; self.cached_input += other.cached_input; self.output += other.output; self.reasoning += other.reasoning; self.total += other.total
 
-LABELS = {
-    "en": {
-        "range": "Range",
-        "calls": "Calls",
-        "sessions": "Sessions",
-        "metric": "Metric",
-        "tokens": "Tokens",
-        "notes": "Notes",
-        "total": "Total",
-        "total_note": "Sum of `total_tokens`",
-        "input_note": "Input tokens, including cached input",
-        "cached_note": "Cached input tokens",
-        "output_note": "Output tokens",
-        "reasoning_note": "Reasoning output tokens",
-        "non_cached": "Non-cached input",
-        "non_cached_note": "`Input - Cached input`",
-        "net": "Net usage",
-        "net_note": "`Non-cached input + Output`",
-        "cache_rate": "Cache hit rate",
-        "cache_rate_note": "`Cached input / Input`",
-        "daily_average": "Daily average total",
-        "daily_average_note": "`Total / days in range`",
-        "peak_day": "Peak day",
-        "peak_week": "Busiest week",
-        "period": "Period",
-    },
-    "zh": {
-        "range": "\u8303\u56f4",
-        "calls": "\u8c03\u7528\u6b21\u6570",
-        "sessions": "\u4f1a\u8bdd\u6570",
-        "metric": "\u6307\u6807",
-        "tokens": "Token \u6570",
-        "notes": "\u8bf4\u660e",
-        "total": "\u603b\u91cf",
-        "total_note": "`total_tokens` \u6c47\u603b",
-        "input_note": "\u8f93\u5165 token\uff0c\u5305\u542b cached input",
-        "cached_note": "\u547d\u4e2d\u7f13\u5b58\u7684\u8f93\u5165 token",
-        "output_note": "\u8f93\u51fa token",
-        "reasoning_note": "\u63a8\u7406\u8f93\u51fa token",
-        "non_cached": "\u975e\u7f13\u5b58 Input",
-        "non_cached_note": "`Input - Cached input`",
-        "net": "\u51c0\u7528\u91cf",
-        "net_note": "`\u975e\u7f13\u5b58 Input + Output`",
-        "cache_rate": "\u7f13\u5b58\u547d\u4e2d\u7387",
-        "cache_rate_note": "`Cached input / Input`",
-        "daily_average": "\u65e5\u5747\u603b\u91cf",
-        "daily_average_note": "`\u603b\u91cf / \u7edf\u8ba1\u5929\u6570`",
-        "peak_day": "\u6700\u591a\u7684\u4e00\u5929",
-        "peak_week": "\u6700\u591a\u7684\u4e00\u5468",
-        "period": "\u5468\u671f",
-    },
-}
+@dataclass
+class SessionMeta:
+    session_id: str; originator: str | None = None; source: str | None = None; cwd: str | None = None
+    @property
+    def project(self): return pathlib.PurePath(self.cwd).name if self.cwd else None
 
+@dataclass
+class TurnContext:
+    model: str | None = None; effort: str | None = None
+
+@dataclass
+class UsageEvent:
+    session_id: str; timestamp: datetime; usage: TokenUsage; model: str | None = None; effort: str | None = None; originator: str | None = None; source: str | None = None; project: str | None = None; title: str | None = None
+    @property
+    def day(self): return self.timestamp.date()
+
+@dataclass
+class DiscoveryStats:
+    files_discovered: int = 0; files_read: int = 0; files_skipped: int = 0; malformed_json_lines: int = 0
+
+@dataclass
+class SessionSummary:
+    session_id: str; title: str | None; project: str | None; originator: str | None; source: str | None; events: int; usage: TokenUsage; first_event: datetime; last_event: datetime; dominant_model: str | None; dominant_model_share: float; dominant_effort: str | None; average_tokens_per_event: float; model_usage: dict[str, TokenUsage] = field(default_factory=dict); effort_usage: dict[str, TokenUsage] = field(default_factory=dict)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Summarize Codex token usage from local session JSONL logs.")
-    parser.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or str(pathlib.Path.home() / ".codex"))
-    parser.add_argument("--timezone", default=None, help="IANA timezone, for example Asia/Shanghai.")
-    parser.add_argument("--days", type=int, default=None, help="Rolling local calendar days ending on --end or today.")
-    parser.add_argument("--start", default=None, help="Inclusive start date, YYYY-MM-DD.")
-    parser.add_argument("--end", default=None, help="Inclusive end date, YYYY-MM-DD.")
-    parser.add_argument("--month", default=None, help="Calendar month, YYYY-MM.")
-    parser.add_argument("--format", choices=["markdown", "json", "html"], default="html")
-    parser.add_argument("--output", type=pathlib.Path, help="Write the report to a UTF-8 file (all formats).")
-    parser.add_argument("--no-open", action="store_true", help="Generate HTML without opening the external browser (automation/headless use).")
-    parser.add_argument("--language", choices=["zh", "en"], default="zh")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Summarize Codex token usage from local session JSONL logs.")
+    p.add_argument("--codex-home", default=os.environ.get("CODEX_HOME") or str(pathlib.Path.home() / ".codex")); p.add_argument("--timezone", default=None); p.add_argument("--days", type=int, default=None); p.add_argument("--start", default=None); p.add_argument("--end", default=None); p.add_argument("--month", default=None); p.add_argument("--format", choices=["markdown", "json", "html"], default="html"); p.add_argument("--output", type=pathlib.Path); p.add_argument("--no-open", action="store_true"); p.add_argument("--language", choices=["zh", "en"], default="zh"); p.add_argument("--machine-name", default=None); p.add_argument("--privacy", choices=["standard", "strict"], default="standard"); p.add_argument("--top-sessions", type=int, default=10)
+    return p.parse_args()
 
-
-def local_today(tz):
-    return datetime.now(tz).date()
-
-
+def local_today(tz): return datetime.now(tz).date()
 def resolve_range(args, tz):
     if args.month:
-        year, month = [int(part) for part in args.month.split("-", 1)]
-        start = date(year, month, 1)
-        end = date(year, month, calendar.monthrange(year, month)[1])
-        today = local_today(tz)
-        if start <= today <= end:
-            end = today
-        return start, end
-
-    end = date.fromisoformat(args.end) if args.end else local_today(tz)
-    if args.start:
-        start = date.fromisoformat(args.start)
-    else:
-        days = args.days or 30
-        start = end - timedelta(days=days - 1)
-    return start, end
-
-
+        y, m = [int(x) for x in args.month.split("-", 1)]; start, end = date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1]); today = local_today(tz); return start, min(end, today) if start <= today <= end else end
+    end = date.fromisoformat(args.end) if args.end else local_today(tz); return (date.fromisoformat(args.start) if args.start else end - timedelta(days=(args.days or 30)-1)), end
 def session_id(path):
-    match = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", path.name)
-    return match.group(1) if match else path.stem
-
-
-def iter_token_events(codex_home, tz):
-    roots = [codex_home / "sessions", codex_home / "archived_sessions"]
-    seen = set()
-    for root in roots:
-        if not root.exists():
-            continue
-        for path in root.rglob("*.jsonl"):
-            sid = session_id(path)
-            try:
-                handle = path.open("r", encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            with handle:
-                for line in handle:
-                    if '"token_count"' not in line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    payload = obj.get("payload") or {}
-                    if payload.get("type") != "token_count":
-                        continue
-                    usage = ((payload.get("info") or {}).get("last_token_usage") or {})
-                    timestamp = obj.get("timestamp")
-                    if not timestamp or not usage:
-                        continue
-                    key = (
-                        sid,
-                        timestamp,
-                        usage.get("total_tokens"),
-                        usage.get("input_tokens"),
-                        usage.get("output_tokens"),
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(tz)
-                    yield {
-                        "session": sid,
-                        "date": dt.date(),
-                        "input": usage.get("input_tokens") or 0,
-                        "cached_input": usage.get("cached_input_tokens") or 0,
-                        "output": usage.get("output_tokens") or 0,
-                        "reasoning": usage.get("reasoning_output_tokens") or 0,
-                        "total": usage.get("total_tokens") or 0,
-                    }
-
-
-def day_count(start, end):
-    return max((end - start).days + 1, 1)
-
-
-def summarize(events, days=None):
-    input_tokens = sum(event["input"] for event in events)
-    cached_input = sum(event["cached_input"] for event in events)
-    output = sum(event["output"] for event in events)
-    reasoning = sum(event["reasoning"] for event in events)
-    total = sum(event["total"] for event in events)
-    non_cached_input = input_tokens - cached_input
-    net_usage = non_cached_input + output
-    return {
-        "calls": len(events),
-        "sessions": len({event["session"] for event in events}),
-        "total": total,
-        "input": input_tokens,
-        "cached_input": cached_input,
-        "output": output,
-        "reasoning": reasoning,
-        "non_cached_input": non_cached_input,
-        "net_usage": net_usage,
-        "cache_hit_rate": (cached_input / input_tokens) if input_tokens else 0,
-        "daily_average_total": (total / days) if days else None,
-    }
-
-
-def week_start(day):
-    return day - timedelta(days=day.weekday())
-
-
-def grouped(events, key_func):
-    buckets = {}
-    for event in events:
-        key = key_func(event)
-        buckets.setdefault(key, []).append(event)
-    return buckets
-
-
-def weekly(events):
-    rows = []
-    for start, bucket in sorted(grouped(events, lambda event: week_start(event["date"])).items()):
-        rows.append({"start": start, "end": start + timedelta(days=6), "summary": summarize(bucket)})
-    return rows
-
-
-def daily(events, start=None, end=None):
-    rows = []
-    buckets = grouped(events, lambda event: event["date"])
-    if start is not None and end is not None:
-        for offset in range((end - start).days + 1):
-            buckets.setdefault(start + timedelta(days=offset), [])
-    for day, bucket in sorted(buckets.items()):
-        rows.append({"date": day, "summary": summarize(bucket)})
-    return rows
-
-
-def fmt(value):
-    if isinstance(value, float):
-        if value.is_integer():
-            return f"{int(value):,}"
-        return f"{value:,.2f}"
-    return f"{value:,}"
-
-
-def fmt_percent(value):
-    return f"{value * 100:.2f}%"
-
-
-def json_ready(value):
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {key: json_ready(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [json_ready(item) for item in value]
-    return value
-
-
-def build_report(start, end, events):
-    days = day_count(start, end)
-    summary = summarize(events, days=days)
-    weeks = weekly(events)
-    days_rows = daily(events, start, end)
-    peak_week = max(weeks, key=lambda row: row["summary"]["total"], default=None)
-    peak_day = max((row for row in days_rows if row["summary"]["calls"]), key=lambda row: row["summary"]["total"], default=None)
-    return {
-        "start": start,
-        "end": end,
-        "days": days,
-        "summary": summary,
-        "peak_week": peak_week,
-        "peak_day": peak_day,
-        "weeks": weeks,
-        "daily": days_rows,
-    }
-
-
-def print_json(report):
-    print(json.dumps(json_ready(report), ensure_ascii=False, indent=2))
-
-
-def print_markdown(report, language):
-    labels = LABELS[language]
-    summary = report["summary"]
-    print(f"{labels['range']}: {report['start']} to {report['end']}")
-    print(f"{labels['calls']}: {summary['calls']:,}")
-    print(f"{labels['sessions']}: {summary['sessions']:,}")
-    print()
-    print(f"| {labels['metric']} | {labels['tokens']} | {labels['notes']} |")
-    print("|---|---:|---|")
-    print(f"| {labels['total']} | {fmt(summary['total'])} | {labels['total_note']} |")
-    print(f"| Input | {fmt(summary['input'])} | {labels['input_note']} |")
-    print(f"| Cached input | {fmt(summary['cached_input'])} | {labels['cached_note']} |")
-    print(f"| Output | {fmt(summary['output'])} | {labels['output_note']} |")
-    print(f"| Reasoning output | {fmt(summary['reasoning'])} | {labels['reasoning_note']} |")
-    print(f"| {labels['non_cached']} | {fmt(summary['non_cached_input'])} | {labels['non_cached_note']} |")
-    print(f"| {labels['net']} | {fmt(summary['net_usage'])} | {labels['net_note']} |")
-    print(f"| {labels['cache_rate']} | {fmt_percent(summary['cache_hit_rate'])} | {labels['cache_rate_note']} |")
-    print(f"| {labels['daily_average']} | {fmt(summary['daily_average_total'])} | {labels['daily_average_note']} |")
-    print()
-    if report["peak_day"]:
-        peak = report["peak_day"]
-        print(f"{labels['peak_day']}: {peak['date']}, {fmt(peak['summary']['total'])} tokens.")
-    if report["peak_week"]:
-        peak = report["peak_week"]
-        print(f"{labels['peak_week']}: {peak['start']} to {peak['end']}, {fmt(peak['summary']['total'])} tokens.")
-        print()
-        print(f"| {labels['period']} | {labels['total']} | {labels['calls']} | {labels['sessions']} |")
-        print("|---|---:|---:|---:|")
-        for row in report["weeks"]:
-            row_summary = row["summary"]
-            print(
-                f"| {row['start']} to {row['end']} | {fmt(row_summary['total'])} | "
-                f"{row_summary['calls']:,} | {row_summary['sessions']:,} |"
-            )
-    print()
-    print("### " + ("每日用量" if language == "zh" else "Daily usage"))
-    print(f"| Date | {labels['total']} | Input | Cached input | Output | {labels['net']} |")
-    print("|---|---:|---:|---:|---:|---:|")
-    for row in report["daily"]:
-        s = row["summary"]
-        print(f"| {row['date']} | {fmt(s['total'])} | {fmt(s['input'])} | {fmt(s['cached_input'])} | {fmt(s['output'])} | {fmt(s['net_usage'])} |")
-
-
-def render_html(report, language="zh"):
-    """Embed aggregate data only; no session paths, prompts or external assets."""
-    template = pathlib.Path(__file__).resolve().parent.parent / "assets" / "dashboard.html"
-    data = json.dumps(json_ready(report), ensure_ascii=False).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
-    return template.read_text(encoding="utf-8").replace("__REPORT_JSON__", data).replace("__LANGUAGE__", language)
-
-
-def open_external_report(path):
-    """Ask the OS to open a local report; never use an embedded browser."""
-    path = path.resolve()
+    found = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", path.name, re.I); return found.group(1) if found else path.stem
+def normalize_source(value: Any):
+    if value is None: return None
+    if isinstance(value, str): return value
+    if isinstance(value, dict): return "subagent:" + str(value["subagent"]) if value.get("subagent") else ("subagent" if "subagent" in value else json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    return str(value)
+def load_session_titles(home, stats=None):
+    out, path = {}, home / "session_index.jsonl"
+    if not path.exists(): return out
     try:
-        if sys.platform == "win32":
-            os.startfile(str(path))
-        elif not webbrowser.open(path.as_uri(), new=2):
-            raise OSError("No external browser accepted the open request")
-    except (OSError, webbrowser.Error) as error:
-        print(f"Report saved; could not request external browser: {error}. Open {path} manually.", file=sys.stderr)
-        return False
-    print(f"External browser open requested: {path}")
-    return True
+        with path.open("r", encoding="utf-8", errors="replace") as h:
+            for line in h:
+                try: row = json.loads(line)
+                except json.JSONDecodeError:
+                    if stats: stats.malformed_json_lines += 1
+                    continue
+                if row.get("id") and row.get("thread_name"): out[str(row["id"])] = str(row["thread_name"])
+    except OSError: pass
+    return out
+def discover_session_files(home, start=None, tz=None, stats=None):
+    paths = [p for root in (home / "sessions", home / "archived_sessions") if root.exists() for p in root.rglob("*.jsonl")]
+    if stats: stats.files_discovered = len(paths)
+    return paths
+@contextlib.contextmanager
+def open_text_with_retry(path, attempts=5, delay_seconds=.1):
+    last = None
+    for attempt in range(attempts):
+        try:
+            h = path.open("r", encoding="utf-8", errors="replace")
+            try: yield h
+            finally: h.close()
+            return
+        except OSError as error:
+            last = error
+            if attempt + 1 < attempts: time.sleep(delay_seconds)
+    raise last
+def parse_session_meta(payload, fallback):
+    vals = payload.get("meta") if isinstance(payload.get("meta"), dict) else payload
+    return SessionMeta(str(vals.get("session_id") or vals.get("id") or fallback), vals.get("originator"), normalize_source(vals.get("source")), vals.get("cwd"))
+def parse_turn_context(payload, previous): return TurnContext(payload.get("model") or previous.model, payload.get("effort") or payload.get("reasoning_effort") or previous.effort)
+def number(value):
+    try: return int(value or 0)
+    except (TypeError, ValueError): return 0
+def parse_token_event(obj, meta, context, titles, tz):
+    raw, stamp = ((obj.get("payload") or {}).get("info") or {}).get("last_token_usage") or {}, obj.get("timestamp")
+    if not raw or not stamp: return None
+    try: timestamp = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(tz)
+    except ValueError: return None
+    input_, cached, output, reasoning = number(raw.get("input_tokens")), number(raw.get("cached_input_tokens")), number(raw.get("output_tokens")), number(raw.get("reasoning_output_tokens"))
+    return UsageEvent(meta.session_id, timestamp, TokenUsage(input_, cached, output, reasoning, number(raw.get("total_tokens")) or input_ + output), context.model, context.effort, meta.originator, meta.source, meta.project, titles.get(meta.session_id))
+def iter_session_events(path, tz, titles, stats):
+    sid, meta, context = session_id(path), SessionMeta(session_id(path)), TurnContext()
+    try:
+        with open_text_with_retry(path) as h:
+            stats.files_read += 1
+            for line in h:
+                if not any(x in line for x in ('"session_meta"','"turn_context"','"token_count"')): continue
+                try: obj = json.loads(line)
+                except json.JSONDecodeError: stats.malformed_json_lines += 1; continue
+                payload, kind = obj.get("payload") or {}, obj.get("type")
+                if kind == "session_meta": meta = parse_session_meta(payload, sid)
+                elif kind == "turn_context": context = parse_turn_context(payload, context)
+                elif kind == "event_msg" and payload.get("type") == "token_count":
+                    event = parse_token_event(obj, meta, context, titles, tz)
+                    if event: yield event
+    except OSError: stats.files_skipped += 1
+def event_identity(event):
+    u = event.usage; return event.session_id, event.timestamp.isoformat(), u.total, u.input, u.cached_input, u.output, u.reasoning
+def iter_token_events(home, tz, stats=None):
+    stats, titles, seen = stats or DiscoveryStats(), load_session_titles(home, stats), set()
+    for path in discover_session_files(home, stats=stats):
+        for event in iter_session_events(path, tz, titles, stats):
+            identity = event_identity(event)
+            if identity not in seen: seen.add(identity); yield event
 
-
+def day_count(start,end): return max((end-start).days+1,1)
+def sum_usage(events):
+    out=TokenUsage()
+    for e in events: out.add(e.usage)
+    return out
+def usage_row(u): return {"total":u.total,"input":u.input,"cached_input":u.cached_input,"output":u.output,"reasoning":u.reasoning,"non_cached_input":u.fresh_input,"net_usage":u.net_usage,"cache_hit_rate":u.cache_hit_rate}
+def summarize(events, days=None):
+    u=sum_usage(events); out=usage_row(u); out.update(calls=len(events), sessions=len({e.session_id for e in events}), daily_average_total=u.total/days if days else None); return out
+def week_start(day): return day-timedelta(days=day.weekday())
+def grouped(events,key):
+    out={}
+    for e in events: out.setdefault(key(e),[]).append(e)
+    return out
+def weekly(events): return [{"start":k,"end":k+timedelta(days=6),"summary":summarize(v)} for k,v in sorted(grouped(events,lambda e:week_start(e.day)).items())]
+def daily(events,start=None,end=None):
+    buckets=grouped(events,lambda e:e.day)
+    if start is not None and end is not None:
+        for n in range((end-start).days+1): buckets.setdefault(start+timedelta(days=n),[])
+    return [{"date":k,"summary":summarize(v)} for k,v in sorted(buckets.items())]
+def summarize_dimension(events, attribute, extra=None):
+    buckets=grouped(events,lambda e:(getattr(e,attribute) or "<unknown>",getattr(e,extra) or "<unknown>" if extra else None)); total=sum_usage(events).total; out=[]
+    for key,bucket in buckets.items():
+        u=sum_usage(bucket); row={attribute:key[0],"events":len(bucket),"sessions":len({e.session_id for e in bucket}),"usage":usage_row(u),"share_total":u.total/total if total else 0}
+        if extra: row[extra]=key[1]
+        out.append(row)
+    return sorted(out,key=lambda x:x["usage"]["total"],reverse=True)
+def summarize_models(events): return summarize_dimension(events,"model")
+def summarize_efforts(events): return summarize_dimension(events,"effort","model")
+def summarize_clients(events): return [{"originator":r["originator"],"source":r["source"],"events":r["events"],"sessions":r["sessions"],"usage":r["usage"],"share_total":r["share_total"]} for r in summarize_dimension(events,"originator","source")]
+def summarize_projects(events): return summarize_dimension(events,"project")
+def summarize_sessions(events):
+    out=[]
+    for sid,bucket in grouped(events,lambda e:e.session_id).items():
+        u,models,efforts=sum_usage(bucket),{},{}
+        for e in bucket: models.setdefault(e.model or "<unknown>",TokenUsage()).add(e.usage); efforts.setdefault(e.effort or "<unknown>",TokenUsage()).add(e.usage)
+        model=max(models,key=lambda k:models[k].total) if models else None; effort=max(efforts,key=lambda k:efforts[k].total) if efforts else None; x=bucket[-1]
+        out.append(SessionSummary(sid,x.title,x.project,x.originator,x.source,len(bucket),u,min(e.timestamp for e in bucket),max(e.timestamp for e in bucket),model,models[model].total/u.total if model and u.total else 0,effort,u.total/len(bucket),models,efforts))
+    return sorted(out,key=lambda x:x.usage.total,reverse=True)
+def detect_usage_diagnostics(summary,sessions):
+    out=[]
+    for x in sessions:
+        share=x.usage.total/summary["total"] if summary["total"] else 0; duration=(x.last_event.date()-x.first_event.date()).days+1; label=x.title or "A local session"
+        if share>=.3: out.append({"severity":"warning","code":"dominant_session","title":"Dominant session","message":f"{label} accounted for {share:.1%} of local token usage.","metric":share})
+        if x.events>=20 and x.average_tokens_per_event>=150000: out.append({"severity":"info","code":"large_context","title":"Large context per event","message":f"{label} averaged {x.average_tokens_per_event:,.0f} tokens per event.","metric":x.average_tokens_per_event})
+        if x.usage.cached_input>=100000000 and x.usage.cache_hit_rate>=.9: out.append({"severity":"info","code":"heavy_cached_context","title":"Heavy cached context","message":f"{label} repeatedly reused a very large cached context.","metric":x.usage.cached_input})
+        if duration>=7 and x.usage.total>=100000000: out.append({"severity":"info","code":"long_lived_high_volume","title":"Long-lived high-volume session","message":f"{label} spans {duration} days with high local usage.","metric":duration})
+    return out
+def public_sessions(sessions,privacy):
+    out=[]
+    for i,x in enumerate(sessions,1): out.append({"session":f"Session #{i}" if privacy=="strict" else (x.title or f"Session #{i}"),"project":None if privacy=="strict" else x.project,"originator":None if privacy=="strict" else x.originator,"source":None if privacy=="strict" else x.source,"events":x.events,"usage":usage_row(x.usage),"dominant_model":x.dominant_model,"dominant_model_share":x.dominant_model_share,"dominant_effort":x.dominant_effort,"average_tokens_per_event":x.average_tokens_per_event,"first_event":x.first_event,"last_event":x.last_event})
+    return out
+def build_report(start,end,events,*,machine_name=None,parser_stats=None,privacy="standard"):
+    events=list(events); stats=parser_stats or DiscoveryStats(); days=day_count(start,end); summary=summarize(events,days); sessions=summarize_sessions(events); weeks,days_rows=weekly(events),daily(events,start,end)
+    return {"schema_version":2,"start":start,"end":end,"days":days,"machine":{"name":machine_name or socket.gethostname()},"summary":summary,"peak_week":max(weeks,key=lambda r:r["summary"]["total"],default=None),"peak_day":max((r for r in days_rows if r["summary"]["calls"]),key=lambda r:r["summary"]["total"],default=None),"weeks":weeks,"daily":days_rows,"models":summarize_models(events),"efforts":summarize_efforts(events),"sessions_detail":public_sessions(sessions,privacy),"clients":summarize_clients(events),"projects":summarize_projects(events),"diagnostics":detect_usage_diagnostics(summary,sessions),"parser":asdict(stats),"privacy":privacy}
+def fmt(v): return f"{v:,.2f}" if isinstance(v,float) and not v.is_integer() else f"{int(v) if isinstance(v,float) else v:,}"
+def json_ready(v):
+    if is_dataclass(v): return json_ready(asdict(v))
+    if isinstance(v,(date,datetime)): return v.isoformat()
+    if isinstance(v,dict): return {k:json_ready(x) for k,x in v.items()}
+    if isinstance(v,list): return [json_ready(x) for x in v]
+    return v
+def print_json(report): print(json.dumps(json_ready(report),ensure_ascii=False,indent=2))
+def print_markdown(report,language,top_sessions=10):
+    s=report["summary"]; print(f"Range: {report['start']} to {report['end']}\nCalls: {s['calls']:,}\nSessions: {s['sessions']:,}\n")
+    print("| Metric | Tokens | Notes |\n|---|---:|---|")
+    for key,label,note in [("total","Total","Sum of `total_tokens`"),("input","Input","Input tokens, including cached input"),("cached_input","Cached input","Cached input tokens"),("output","Output","Output tokens"),("reasoning","Reasoning output","Reasoning output tokens"),("non_cached_input","Non-cached input","`Input - Cached input`"),("net_usage","Net usage","`Non-cached input + Output`")]: print(f"| {label} | {fmt(s[key])} | {note} |")
+    print(f"| Cache hit rate | {s['cache_hit_rate']*100:.2f}% | `Cached input / Input` |\n| Daily average total | {fmt(s['daily_average_total'])} | `Total / days in range` |")
+    if report["peak_day"]: print(f"\nPeak day: {report['peak_day']['date']}, {fmt(report['peak_day']['summary']['total'])} tokens.")
+    if report["peak_week"]: print(f"Busiest week: {report['peak_week']['start']} to {report['peak_week']['end']}, {fmt(report['peak_week']['summary']['total'])} tokens.")
+    print("\n### Daily usage\n\n| Date | Total | Input | Cached input | Output | Net usage |\n|---|---:|---:|---:|---:|---:|")
+    for r in report["daily"]: u=r["summary"]; print(f"| {r['date']} | {fmt(u['total'])} | {fmt(u['input'])} | {fmt(u['cached_input'])} | {fmt(u['output'])} | {fmt(u['net_usage'])} |")
+    print("\n## By model\n\n| Model | Total | Events |\n|---|---:|---:|"+"\n".join(f"| {r['model']} | {fmt(r['usage']['total'])} | {r['events']:,} |" for r in report["models"][:10]))
+    print("\n## Top sessions\n\n| Session | Total | Events |\n|---|---:|---:|"+"\n".join(f"| {r['session']} | {fmt(r['usage']['total'])} | {r['events']:,} |" for r in report["sessions_detail"][:top_sessions]))
+    if report["diagnostics"]: print("\n## Diagnostics\n\n"+"\n".join(f"- {r['title']}: {r['message']}" for r in report["diagnostics"]))
+def render_html(report,language="zh"):
+    template=pathlib.Path(__file__).resolve().parent.parent/"assets"/"dashboard.html"; data=json.dumps(json_ready(report),ensure_ascii=False).replace("&","\\u0026").replace("<","\\u003c").replace(">","\\u003e"); return template.read_text(encoding="utf-8").replace("__REPORT_JSON__",data).replace("__LANGUAGE__",language)
+def open_external_report(path):
+    path=path.resolve()
+    try:
+        if sys.platform=="win32": os.startfile(str(path))
+        elif not webbrowser.open(path.as_uri(),new=2): raise OSError("No external browser accepted the open request")
+    except (OSError,webbrowser.Error) as error: print(f"Report saved; could not request external browser: {error}. Open {path} manually.",file=sys.stderr); return False
+    print(f"External browser open requested: {path}"); return True
 def main():
-    args = parse_args()
-    tz = ZoneInfo(args.timezone) if args.timezone else datetime.now().astimezone().tzinfo
-    codex_home = pathlib.Path(args.codex_home).expanduser()
-    start, end = resolve_range(args, tz)
-    if start > end or (args.days is not None and args.days < 1):
-        raise SystemExit("Invalid range: start must be on or before end, and days must be positive.")
-    events = [event for event in iter_token_events(codex_home, tz) if start <= event["date"] <= end]
-    report = build_report(start, end, events)
-    report["timezone"] = str(tz)
-    report["generated_at"] = datetime.now(tz).isoformat(timespec="seconds")
-    if args.format == "html":
-        output = render_html(report, args.language)
-        if args.output is None:
-            args.output = pathlib.Path.cwd() / "output" / f"token-usage-{start}-{end}.html"
+    args=parse_args(); tz=ZoneInfo(args.timezone) if args.timezone else datetime.now().astimezone().tzinfo; home=pathlib.Path(args.codex_home).expanduser(); start,end=resolve_range(args,tz)
+    if start>end or (args.days is not None and args.days<1): raise SystemExit("Invalid range: start must be on or before end, and days must be positive.")
+    stats=DiscoveryStats(); events=[e for e in iter_token_events(home,tz,stats) if start<=e.day<=end]; report=build_report(start,end,events,machine_name=args.machine_name,parser_stats=stats,privacy=args.privacy); report["timezone"]=args.timezone or str(tz); report["generated_at"]=datetime.now(tz).isoformat(timespec="seconds")
+    if args.format=="html": output=render_html(report,args.language); args.output=args.output or pathlib.Path.cwd()/"output"/f"token-usage-{start}-{end}.html"
     else:
-        import contextlib
-        import io
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            if args.format == "json":
-                print_json(report)
-            else:
-                print_markdown(report, args.language)
-        output = buffer.getvalue()
+        b=io.StringIO()
+        with contextlib.redirect_stdout(b): print_json(report) if args.format=="json" else print_markdown(report,args.language,args.top_sessions)
+        output=b.getvalue()
     if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(output, encoding="utf-8")
-        print(f"Report written to {args.output.resolve()}")
-        if args.format == "html" and not args.no_open:
-            open_external_report(args.output)
-    else:
-        print(output, end="")
-
-
-if __name__ == "__main__":
-    main()
+        args.output.parent.mkdir(parents=True,exist_ok=True); args.output.write_text(output,encoding="utf-8"); print(f"Report written to {args.output.resolve()}")
+        if args.format=="html" and not args.no_open: open_external_report(args.output)
+    else: print(output,end="")
+if __name__=="__main__": main()

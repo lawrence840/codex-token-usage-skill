@@ -4,10 +4,12 @@ import subprocess
 import sys
 import tempfile
 import re
-from datetime import date
+import contextlib
+import io
+from datetime import date, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
-from codex_token_usage import build_report, render_html
+from codex_token_usage import DiscoveryStats, build_report, iter_token_events, render_html
 
 
 SCRIPT = Path(__file__).with_name("codex_token_usage.py")
@@ -44,9 +46,8 @@ def write_session(codex_home):
 
 
 def run_script(codex_home, *args):
+    import codex_token_usage as usage
     command = [
-        sys.executable,
-        "-B",
         str(SCRIPT),
         "--codex-home",
         str(codex_home),
@@ -57,8 +58,13 @@ def run_script(codex_home, *args):
         "--no-open",
         *args,
     ]
-    return subprocess.run(command, text=True, encoding="utf-8", capture_output=True, check=True,
-                          env={**__import__('os').environ, "PYTHONIOENCODING": "utf-8"})
+    stdout, stderr = io.StringIO(), io.StringIO()
+    try:
+        with patch.object(sys, 'argv', command), patch.object(usage, 'ZoneInfo', return_value=timezone(timedelta(hours=8))), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            usage.main()
+    except SystemExit as error:
+        raise subprocess.CalledProcessError(error.code or 1, command, stdout.getvalue(), stderr.getvalue() or str(error))
+    return subprocess.CompletedProcess(command, 0, stdout.getvalue(), stderr.getvalue())
 
 
 def test_json_output():
@@ -176,7 +182,7 @@ def test_default_html_and_browser_dispatch():
         args.timezone = 'Asia/Shanghai'
         args.start, args.end = '2026-04-28', '2026-04-29'
         expected = home / 'output' / 'token-usage-2026-04-28-2026-04-29.html'
-        with patch.object(usage, 'parse_args', return_value=args), patch.object(Path, 'cwd', return_value=home), patch.object(usage, 'open_external_report') as browser:
+        with patch.object(usage, 'parse_args', return_value=args), patch.object(usage, 'ZoneInfo', return_value=timezone(timedelta(hours=8))), patch.object(Path, 'cwd', return_value=home), patch.object(usage, 'open_external_report') as browser:
             usage.main()
             assert expected.exists()
             browser.assert_called_once_with(expected)
@@ -195,6 +201,32 @@ def test_default_html_and_browser_dispatch():
             assert expected.exists()
 
 
+def test_attribution_privacy_and_diagnostics():
+    with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp:
+        home = Path(temp)
+        log_dir = home / "sessions" / "2026" / "08" / "01"
+        log_dir.mkdir(parents=True)
+        sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        path = log_dir / ("rollout-" + sid + ".jsonl")
+        rows = [
+            {"type": "session_meta", "payload": {"id": sid, "originator": "Codex Desktop", "source": {"subagent": "review"}, "cwd": "F:/projects/Mining"}},
+            {"type": "turn_context", "payload": {"model": "gpt-5.6-terra", "reasoning_effort": "medium"}},
+        ]
+        for index in range(20):
+            rows.append({"timestamp": f"2026-09-01T{index:02d}:00:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 200000, "cached_input_tokens": 190000, "output_tokens": 1000, "reasoning_output_tokens": 200, "total_tokens": 201000}}}})
+        rows.insert(12, {"type": "turn_context", "payload": {"model": "gpt-6-astra", "effort": "high"}})
+        path.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+        (home / "session_index.jsonl").write_text(json.dumps({"id": sid, "thread_name": "Mining audit"}), encoding="utf-8")
+        stats = DiscoveryStats()
+        events = list(iter_token_events(home, timezone(timedelta(hours=8)), stats))
+        standard = build_report(date(2026, 9, 1), date(2026, 9, 9), events, parser_stats=stats)
+        strict = build_report(date(2026, 9, 1), date(2026, 9, 9), events, privacy="strict")
+    assert len(standard["sessions_detail"]) == 1
+    assert standard["models"][0]["usage"]["total"] + standard["models"][1]["usage"]["total"] == standard["summary"]["total"]
+    assert standard["sessions_detail"][0]["project"] == "Mining"
+    assert standard["clients"][0]["source"] == "subagent:review"
+    assert any(item["code"] == "large_context" for item in standard["diagnostics"])
+    assert strict["sessions_detail"][0]["session"] == "Session #1" and strict["sessions_detail"][0]["project"] is None
 if __name__ == "__main__":
     test_json_output()
     test_markdown_output_mentions_new_metrics()
@@ -204,4 +236,5 @@ if __name__ == "__main__":
     test_timezone_and_archive_deduplication()
     test_invalid_range()
     test_default_html_and_browser_dispatch()
+    test_attribution_privacy_and_diagnostics()
     print("tests passed")
