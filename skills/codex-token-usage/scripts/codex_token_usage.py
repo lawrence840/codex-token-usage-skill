@@ -190,9 +190,13 @@ def public_sessions(sessions,privacy):
     out=[]
     for i,x in enumerate(sessions,1): out.append({"session":f"Session #{i}" if privacy=="strict" else (x.title or f"Session #{i}"),"project":None if privacy=="strict" else x.project,"originator":None if privacy=="strict" else x.originator,"source":None if privacy=="strict" else x.source,"events":x.events,"usage":usage_row(x.usage),"dominant_model":x.dominant_model,"dominant_model_share":x.dominant_model_share,"dominant_effort":x.dominant_effort,"average_tokens_per_event":x.average_tokens_per_event,"first_event":x.first_event,"last_event":x.last_event})
     return out
+def public_diagnostics(diagnostics,privacy):
+    if privacy!="strict": return diagnostics
+    return [{**item,"message":"A local session matched this diagnostic heuristic."} for item in diagnostics]
 def build_report(start,end,events,*,machine_name=None,parser_stats=None,privacy="standard"):
     events=list(events); stats=parser_stats or DiscoveryStats(); days=day_count(start,end); summary=summarize(events,days); sessions=summarize_sessions(events); weeks,days_rows=weekly(events),daily(events,start,end)
-    return {"schema_version":2,"start":start,"end":end,"days":days,"machine":{"name":machine_name or socket.gethostname()},"summary":summary,"peak_week":max(weeks,key=lambda r:r["summary"]["total"],default=None),"peak_day":max((r for r in days_rows if r["summary"]["calls"]),key=lambda r:r["summary"]["total"],default=None),"weeks":weeks,"daily":days_rows,"models":summarize_models(events),"efforts":summarize_efforts(events),"sessions_detail":public_sessions(sessions,privacy),"clients":summarize_clients(events),"projects":summarize_projects(events),"diagnostics":detect_usage_diagnostics(summary,sessions),"parser":asdict(stats),"privacy":privacy}
+    diagnostics=detect_usage_diagnostics(summary,sessions)
+    return {"schema_version":2,"start":start,"end":end,"days":days,"machine":{"name":machine_name or socket.gethostname()},"summary":summary,"peak_week":max(weeks,key=lambda r:r["summary"]["total"],default=None),"peak_day":max((r for r in days_rows if r["summary"]["calls"]),key=lambda r:r["summary"]["total"],default=None),"weeks":weeks,"daily":days_rows,"models":summarize_models(events),"efforts":summarize_efforts(events),"sessions_detail":public_sessions(sessions,privacy),"clients":[] if privacy=="strict" else summarize_clients(events),"projects":[] if privacy=="strict" else summarize_projects(events),"diagnostics":public_diagnostics(diagnostics,privacy),"parser":asdict(stats),"privacy":privacy}
 def fmt(v): return f"{v:,.2f}" if isinstance(v,float) and not v.is_integer() else f"{int(v) if isinstance(v,float) else v:,}"
 def json_ready(v):
     if is_dataclass(v): return json_ready(asdict(v))

@@ -9,7 +9,7 @@ import io
 from datetime import date, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
-from codex_token_usage import DiscoveryStats, build_report, iter_token_events, render_html
+from codex_token_usage import DiscoveryStats, build_report, iter_token_events, json_ready, render_html
 
 
 SCRIPT = Path(__file__).with_name("codex_token_usage.py")
@@ -227,6 +227,8 @@ def test_attribution_privacy_and_diagnostics():
     assert standard["clients"][0]["source"] == "subagent:review"
     assert any(item["code"] == "large_context" for item in standard["diagnostics"])
     assert strict["sessions_detail"][0]["session"] == "Session #1" and strict["sessions_detail"][0]["project"] is None
+    assert not strict["clients"] and not strict["projects"]
+    assert "Mining audit" not in json.dumps(json_ready(strict)) and "Mining" not in json.dumps(json_ready(strict))
 if __name__ == "__main__":
     test_json_output()
     test_markdown_output_mentions_new_metrics()
